@@ -2,107 +2,92 @@
 
 ## Topology
 
+plants-watcher is a producer. It ends at the broker: nodes measure and publish, and [central-pipeline](https://github.com/OscarCarPu/central-pipeline) owns ingestion, storage, calibration, watering logic and alerts. There is no resident process in this repo and no local database.
+
 ```mermaid
 graph LR
-    subgraph pots["Pots (battery, 2xAAA)"]
-        N1["Node 1"]
+    subgraph pots["Pots (battery)"]
+        N1["Node 1\n(XIAO ESP32-C3)"]
         N2["Node 2"]
         NN["Node N"]
     end
 
     subgraph homelab["Home Lab"]
-        GW["BLE Gateway\n(Go, passive scan)"]
         MQTT["MQTT Broker"]
-        Consumer["Consumer\n(Go)"]
-        DB[("SQLite")]
+
+        subgraph cp["central-pipeline"]
+            Raw[("raw\nbronze")]
+            Staging["staging\nsilver"]
+            Marts["marts\ngold"]
+        end
     end
 
-    Bridge["ESP32 BLE bridge\n(optional, mains powered)"]
     Telegram["Telegram Bot"]
+    API["gv-api"]
 
-    N1 -- "BLE adv" --> GW
-    N2 -- "BLE adv" --> GW
-    NN -- "BLE adv" --> Bridge
-    Bridge -- "MQTT" --> MQTT
-    GW -- "plants/+/telemetry" --> MQTT
-    MQTT --> Consumer
-    Consumer --> DB
-    Consumer -- "events/plants/+/*" --> MQTT
-    Consumer -. "alerts" .-> Telegram
+    N1 -- "events/plants/1/telemetry" --> MQTT
+    N2 --> MQTT
+    NN --> MQTT
+    MQTT --> Raw
+    Raw --> Staging
+    Staging --> Marts
+    Marts --> API
+    Marts -. "watering alert" .-> Telegram
+    Marts -- "events/plants/+/water\nevents/plants/+/alert" --> MQTT
 ```
 
-The optional ESP32 bridge exists only for coverage. Indoor BLE range through walls is roughly 10-15 m, so a single gateway may not hear every pot. A mains-powered ESP32 placed in a far room decodes the same advertisements and publishes to the same topics — the consumer cannot tell the difference.
+One design rule drives everything else:
+
+**Nodes do not decide.** They publish raw millivolts and nothing more. All calibration and watering logic lives downstream, so it can be changed and re-run against stored history without reflashing devices buried in pots. A node that computed a moisture percentage would freeze a calibration into firmware and make every improvement a flashing job.
 
 ## Node — per wake cycle
 
-The node runs the same cycle forever. Nothing persists across cycles except a sequence counter and the sensor warm-up state, both held in retained RAM.
+Phases 0 and 1 run on a XIAO ESP32-C3 that publishes MQTT directly over WiFi. The only state that persists across cycles is the `seq` counter and the cached association parameters, both in RTC memory.
 
 ```mermaid
 flowchart TD
-    Wake([RTC wakeup, every SAMPLE_INTERVAL]) --> PwrOn[Enable sensor rail]
-    PwrOn --> Settle[Wait for probe oscillator to settle]
-    Settle --> Soil["Drive probe with PWM\nRectify, read SAADC\nAverage N samples"]
-    Soil --> NTC[Read soil NTC via SAADC]
+    Wake([Wake from deep sleep, every SAMPLE_INTERVAL]) --> PwrOn[Enable sensor rail]
+    PwrOn --> Settle[Wait for the probe drive to settle]
+    Settle --> Soil["Drive probe, rectify, read ADC\nAverage N samples"]
+    Soil --> NTC[Read soil NTC via ADC]
     NTC --> SHT[Read SHT40 over I2C]
-    SHT --> Vdd["Read VDD via SAADC\n(internal, no divider)"]
-    Vdd --> PwrOff[Disable sensor rail]
-    PwrOff --> Pack["Pack BTHome v2 payload\nseq += 1"]
-    Pack --> Adv["Broadcast 3 advertisements\n~15 ms total"]
-    Adv --> Sleep[System ON sleep with RTC]
+    SHT --> Vbat[Read battery voltage]
+    Vbat --> PwrOff[Disable sensor rail]
+    PwrOff --> WiFi["Connect WiFi\nstatic IP, cached BSSID and channel"]
+    WiFi --> Time[SNTP if the clock is unset]
+    Time --> Pub["Publish events/plants/<id>/telemetry\nseq += 1"]
+    Pub --> Sleep[Deep sleep SAMPLE_INTERVAL]
     Sleep --> Wake
 ```
 
-### Why System ON sleep, not System OFF
+Sensors are read *before* the radio comes up, and the rail is off again before association starts. The two never overlap, so the peak draw the battery has to support is the radio's alone.
 
-System OFF on the nRF52840 is ~0.4 uA versus ~1.5-3 uA for System ON with the RTC running. Over five years the difference is under 100 mAh out of a 1000 mAh AAA pair — real, but not decisive.
-
-System ON keeps RAM and the RTC alive, which means the sequence counter and any calibration state survive without touching retention registers, and the Embassy timer just works. The simpler firmware is worth the microamp.
-
-## Gateway
-
-Passive BLE scanning on Linux requires kernel >= 5.10 and BlueZ >= 5.56. Passive means the gateway never sends a scan request, so nodes are never woken or asked to respond — they stay pure broadcasters.
-
-The gateway holds the only piece of per-plant configuration it needs: a mapping from BLE MAC address to `plant_id`. Everything else about a plant lives in the consumer.
-
-Its job is deliberately thin: decode BTHome, stamp `ts` on reception, look up the `plant_id`, publish. No logic, no storage. If it dies, you lose samples but nothing is corrupted.
-
-## Consumer
-
-```mermaid
-flowchart TD
-    Boot([Boot]) --> Load[Load plants.yaml]
-    Load --> Connect["Connect MQTT\n(auto-reconnect)"]
-    Connect --> Sub[Subscribe plants/+/telemetry]
-
-    Sub --> Rx([Telemetry received])
-    Rx --> Dedup{"seen (plant_id, seq)\nrecently?"}
-    Dedup -->|Yes| Drop[Drop duplicate]
-    Dedup -->|No| Store[Insert into SQLite]
-    Store --> Calc["Convert raw_mv to moisture %\nusing per-plant calibration"]
-    Calc --> Decide{Below watering threshold?}
-    Decide -->|No| Idle[idle]
-    Decide -->|Yes| Alerted{Already alerted?}
-    Alerted -->|Yes| Idle
-    Alerted -->|No| Notify["Telegram: 'Plant X needs water'\nPublish events/plants/X/alert"]
-```
-
-Deduplication by `(plant_id, seq)` is what makes multiple gateways safe. The same physical advertisement heard by two receivers produces two MQTT messages with the same sequence number; the consumer keeps the first.
-
-The alert latch clears when moisture rises back above the threshold — same pattern as `ALERT_STATE` in mutual-watchdog, just held in the consumer instead of RTC memory.
+Publishing is best-effort. A failed association or a broker that will not answer costs one sample, and the node goes back to sleep rather than retrying — a retry loop turns a network problem into a flat battery, and the gap is visible downstream as a missing `seq` anyway.
 
 ## Power budget
 
-Per node, at a 10 minute sample interval.
+Per node, hourly sample interval, on a 1200 mAh LiPo.
 
 | Item | Current | Duration | Per cycle |
 |---|---|---|---|
-| Sleep (System ON + RTC) | ~2 uA | 600 s | 0.33 uAh |
+| Deep sleep (XIAO board) | ~45 uA | 3600 s | 45 uAh |
 | Sensor rail + measurement | ~1 mA | ~50 ms | 0.014 uAh |
-| BLE advertising (3x) | ~5 mA | ~15 ms | 0.021 uAh |
-| **Total** | | | **~0.37 uAh** |
+| WiFi associate + publish | ~80 mA | ~2 s | ~45 uAh |
+| **Total** | | | **~90 uAh** |
 
-That is ~0.9 uAh/hour, ~21 uAh/day, dominated almost entirely by sleep current. A 2xAAA alkaline pair (~1000 mAh) gives a theoretical life far beyond the shelf life of the batteries themselves; assume you are limited by self-discharge, not by the node.
+That is ~2.2 mAh/day, or roughly **18 months** on a 1200 mAh LiPo.
 
-The practical consequence: **do not optimise the radio, optimise the sleep current.** Anything left powered — a pull-up on an unused line, the probe oscillator, a leaky FET — costs more than every transmission combined.
+The budget splits almost exactly in half between sleeping and talking, which sets the two things worth optimising and the order to do them in:
 
-For comparison, the same duty cycle over WiFi + MQTT costs roughly 150 uAh per cycle, four orders of magnitude more, which is why the radio choice is what it is. See [hardware](hardware.md#why-not-esp32--wifi).
+- **Association, not transmission.** Getting onto the network is the entire radio cost; the publish itself is milliseconds. A static IP with a cached BSSID and channel in RTC memory skips DHCP and the scan, and is the difference between ~2 s and ~6 s awake — roughly 8 months of battery life.
+- **Sample interval, not efficiency.** Soil moisture moves over days. Every halving of the interval doubles the association cost for a signal that has not changed. Hourly is already generous; the 10-minute interval that seems natural for telemetry costs six times as much for no extra information.
+
+The 45 uA sleep figure is the XIAO board, not the chip — the battery-sense divider and the QSPI flash. A bare ESP32-C3 module reaches ~6 uA, which alone takes the same node past two and a half years. That is a phase 2 decision, not a phase 1 problem, and it is worth measuring before designing around it.
+
+For contrast, an nRF52840 broadcasting BLE instead of associating costs ~0.02 uAh per cycle against ~45, which is what makes a multi-year alkaline node possible at any interval. The full comparison, and why the radio is not decided yet, is in [hardware](hardware.md#mcu-and-radio--decided-at-phase-2).
+
+## Downstream
+
+Nodes publish `events/plants/<plant_id>/telemetry` and stop there. What happens next — dedup, calibration, thresholds, alerts, history — is central-pipeline's, documented in [MQTT topics](topics_mqtt.md) as a contract and in [watering logic](watering_logic.md) as intent.
+
+The consequence worth internalising: this repo can be entirely rewritten, and the radio swapped, without anything downstream noticing, as long as the same events keep arriving.
